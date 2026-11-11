@@ -6,6 +6,18 @@
 
 本项目参考了 [AutoLogin_Mail for UPC Network Authentication](https://github.com/mrwtong/UPC_WebAutoLogin_Mail)，感谢原作者的工作！
 
+
+稍微激进参数
+```bash
+python3 upc_watchdog_aggressive.py \
+  --offline-interval 1 \
+  --unknown-reprobes 2 \
+  --auth-cooldown 10 \
+  --retry-base 3 \
+  --retry-max 3000 \
+  --debug
+```
+
 ## ✨ 功能特性
 
 - **自动认证**：识别 UPC 校园网认证页面，自动提交账号密码。
