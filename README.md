@@ -6,14 +6,14 @@
 
 本项目参考了 [AutoLogin_Mail for UPC Network Authentication](https://github.com/mrwtong/UPC_WebAutoLogin_Mail)，感谢原作者的工作！
 
-windows 自动启动：
+## windows 自动启动：
 ```bash
 1. win+R
 2. 输入 shell:startup
 3. 放个bat快捷方式就行
 ```
 
-稍微激进参数
+## 稍微激进参数
 ```bash
 python3 upc_watchdog_aggressive.py \
   --offline-interval 1 \
