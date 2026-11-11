@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """UPC captive portal watchdog. Python 3.9+, no Python dependencies.
@@ -51,7 +50,7 @@ CHECKS = (
     ("http://captive.apple.com/hotspot-detect.html", 200, b"Success"),
 )
 MAX_HTTP_BYTES = 32 * 1024
-USER_AGENT = "UPCPortalWatchdog/2.1 (Python stdlib)"
+USER_AGENT = "UPCPortalWatchdog/2.2-aggressive (Python stdlib)"
 
 # Keep the original [+/ -/ */ !] status style, including the Windows console.
 LOG_COLORS = {"+": "\033[32m", "-": "\033[31m", "*": "\033[36m", "!": "\033[33m"}
@@ -847,7 +846,7 @@ class Watchdog:
         self.current_network: Network | None = None
         self.state = "STARTING"
         self.next_login = 0.0
-        self.delay = 10
+        self.delay = args.retry_base
         self.blocked_credentials = False
         self.last_alive_log = 0.0
         self.network_checked_at = 0.0
@@ -856,6 +855,9 @@ class Watchdog:
         self.pending_auth_at = 0.0
         self.pending_auth_warned = False
         self.last_probe_evidence = ""
+        self.unknown_rounds = 0
+        self.next_portal_discovery = 0.0
+        self.auth_success_deadline = 0.0
         self.terminal = getattr(sys.stdout, "isatty", lambda: False)()
         self.color_enabled = not getattr(args, "no_color", False) and supports_ansi_color()
         self.heartbeat_enabled = not getattr(args, "no_heartbeat", False)
@@ -927,7 +929,8 @@ class Watchdog:
                 self.config.save()
                 self.blocked_credentials = False
                 self.next_login = 0.0
-                self.delay = 10
+                self.delay = self.args.retry_base
+                self.auth_success_deadline = 0.0
                 self._reset_pending_auth()
             protection = "Windows DPAPI 加密" if os.name == "nt" else "权限 0600，仅限制本地访问（非加密）"
             self.log(f"账号 {user} 的认证配置已保存（{protection}）", "+")
@@ -954,7 +957,10 @@ class Watchdog:
             if not self.args.portal_url:
                 self.portal_url = ""
             self.next_login = 0.0
-            self.delay = 10
+            self.delay = self.args.retry_base
+            self.unknown_rounds = 0
+            self.next_portal_discovery = 0.0
+            self.auth_success_deadline = 0.0
             self._reset_pending_auth()
         return network
 
@@ -1025,11 +1031,48 @@ class Watchdog:
             pass
         return "UNKNOWN", ""
 
+    def discover_portal(self, network: Network | None) -> str:
+        """Try to elicit a trusted portal URL, never treating a plain 200 as captive."""
+        now = time.monotonic()
+        if now < self.next_portal_discovery:
+            return ""
+        self.next_portal_discovery = now + 15
+        # A new HTTP request may elicit the gateway's real redirect and queryString.
+        for url in ("http://neverssl.com/", "http://wlan.upc.edu.cn/",
+                    "http://lan.upc.edu.cn/"):
+            try:
+                response = self.http.request(url, network)
+                portal = extract_portal_redirect(response, self.args.portal_url or "")
+                if portal:
+                    return portal
+            except (OSError, ValueError, ssl.SSLError, http.client.HTTPException) as exc:
+                if self.args.debug:
+                    self.log(f"Portal 主动发现 {urlsplit(url).hostname} 失败：{exc}", "!")
+        return ""
+
+    def recover_unknown(self, network: Network | None) -> tuple[str, str]:
+        """Re-send connectivity probes immediately; refresh DNS/ARP decisions."""
+        if self.state != "UNKNOWN":
+            self.log("外网异常：清理 DNS/ARP 缓存并立即补发连通性探测报文", "!")
+        for _ in range(self.args.unknown_reprobes):
+            self.resolver.clear()
+            state, portal = self.probe(network)
+            if state != "UNKNOWN":
+                return state, portal
+        # No known portal: proactively provoke a *trusted* captive redirect.
+        if not self.portal_url:
+            self.resolver.clear()
+            portal = self.discover_portal(network)
+            if portal:
+                return "CAPTIVE", portal
+        return "UNKNOWN", ""
+
     def login(self, network: Network | None) -> bool:
         if not self.portal_url or not approved_portal(self.portal_url, self.args.portal_url or ""):
             self.log("没有可信 Portal 地址，拒绝发送密码", "-")
             return False
-        if self.blocked_credentials or time.monotonic() < self.next_login:
+        if (self.blocked_credentials or time.monotonic() < self.next_login
+                or time.monotonic() < self.auth_success_deadline):
             return False
         with self.config_lock:
             if not self.config.user or not self.config.password:
@@ -1066,8 +1109,9 @@ class Watchdog:
                 suffix = f"；网关信息：{detail}" if detail else ""
                 self.log(f"网关已返回认证成功（账号: {user}）{suffix}；正在复核外网连通性...", "*")
                 self.resolver.clear()  # Captive DNS responses must not survive login.
-                self.next_login = time.monotonic() + 40  # Avoid duplicate POST storms.
-                self.delay = 10
+                self.auth_success_deadline = time.monotonic() + self.args.auth_cooldown
+                self.next_login = self.auth_success_deadline
+                self.delay = self.args.retry_base
                 return True
             if outcome == "failure" and any(term in detail for term in (
                     "账号或密码错误", "密码错误", "用户不存在", "账号不存在", "用户或密码", "用户名或密码")):
@@ -1081,9 +1125,9 @@ class Watchdog:
 
     def _retry(self, reason: str) -> bool:
         self._reset_pending_auth()
-        delay = min(180, self.delay) + random.uniform(0, 2)
+        delay = min(self.args.retry_max, self.delay) + random.uniform(0, 1)
         self.next_login = time.monotonic() + delay
-        self.delay = min(self.delay * 2, 180)
+        self.delay = min(max(self.args.retry_base, self.delay * 2), self.args.retry_max)
         self.log(f"{reason}；约 {int(delay)} 秒后可重试", "-")
         return False
 
@@ -1093,6 +1137,16 @@ class Watchdog:
             self._set_state("LINK_DOWN")
             return
         state, portal = self.probe(network)
+        if state == "UNKNOWN" and self.args.unknown_reprobes:
+            state, portal = self.recover_unknown(network)
+        elif state == "UNKNOWN" and not self.portal_url:
+            portal = self.discover_portal(network)
+            if portal:
+                state = "CAPTIVE"
+        if state == "UNKNOWN":
+            self.unknown_rounds += 1
+        else:
+            self.unknown_rounds = 0
         if self.args.debug and self.resolver.last_method != self.last_dns_method:
             self.last_dns_method = self.resolver.last_method
             if self.last_dns_method:
@@ -1102,7 +1156,7 @@ class Watchdog:
         self._set_state(state)
         if state == "ONLINE":
             self.next_login = 0.0
-            self.delay = 10
+            self.delay = self.args.retry_base
             if self.heartbeat_enabled and self.terminal and not self.pause.is_set():
                 with self.config_lock:
                     user = self.config.user or "未配置"
@@ -1112,7 +1166,15 @@ class Watchdog:
             self.login(network)
         elif state == "UNKNOWN":
             self._warn_if_auth_unconfirmed()
-            # Do not POST credentials just because one external endpoint timed out.
+            # User-opted aggressive default: after the original probe and a fresh
+            # reprobe both fail, reuse only an already-validated portal URL.
+            # login() enforces credential lockout and a minimum POST cooldown.
+            if (not self.pause.is_set() and not self.args.no_unknown_reauth
+                    and self.unknown_rounds >= self.args.unknown_threshold
+                    and self.portal_url and not self.blocked_credentials
+                    and time.monotonic() >= max(self.next_login, self.auth_success_deadline)):
+                self.log("外网仍不通，使用已知可信 Portal 主动重发认证请求", "!")
+                self.login(network)
 
     def _warn_if_auth_unconfirmed(self):
         if (self.pending_auth_user and not self.pending_auth_warned and
@@ -1152,9 +1214,9 @@ class Watchdog:
                 self.log("检测到校园认证页面，准备自动登录", "*")
         elif state == "UNKNOWN":
             if previous == "ONLINE":
-                self.log("外网连接异常，暂不能确认是否需要认证；持续检测避免误登录", "-")
+                self.log("外网连接异常，已启动快速重探与限速重新认证策略", "-")
             else:
-                self.log("外网状态暂不确定，继续探测（不会因普通超时反复登录）", "!")
+                self.log("外网暂时不可达，持续重新发包并尝试发现校园 Portal", "!")
         else:
             self.log(f"网络状态更新: {previous} -> {state}", "*")
 
@@ -1172,7 +1234,8 @@ class Watchdog:
                     traceback.print_exc()
             if self.args.once:
                 return
-            self.stop.wait(12 if self.state == "ONLINE" else 4)
+            self.stop.wait(self.args.online_interval if self.state == "ONLINE"
+                           else self.args.offline_interval)
 
     def start(self):
         if self.args.portal_url and not approved_portal(self.args.portal_url, self.args.portal_url):
@@ -1181,7 +1244,9 @@ class Watchdog:
             self.setup()
             if not self.config.load():
                 raise SystemExit("没有可用配置。请在交互终端配置后重试。")
-        self.log("认证守护进程启动：优先原始以太网 ARP/DNS；HTTP/TLS 仍使用 TCP", "+")
+        self.log("认证守护进程启动：激进恢复模式；优先原始以太网 ARP/DNS，HTTP/TLS 使用 TCP", "+")
+        self.log(f"掉线每 {self.args.offline_interval:g}s 重查；未知状态重探 {self.args.unknown_reprobes} 次；"
+                 f"认证成功冷却 {self.args.auth_cooldown:g}s，失败退避不超过 {self.args.retry_max:g}s", "*")
         if IS_LINUX and os.geteuid() != 0:
             self.log("提示：当前非 root。若无 CAP_NET_RAW，将使用系统 DNS 作为回退", "!")
         if os.name == "nt":
@@ -1220,7 +1285,23 @@ def main():
     p.add_argument("--config", default=str(Path.home() / ".upc.json"),
                    help="JSON 认证配置文件，自动兼容旧版 ~/.upc")
     p.add_argument("--portal-url", default="", help="显式可信的 Portal 重定向 URL")
-    p.add_argument("--timeout", type=float, default=3.0, help="HTTP 超时秒数")
+    p.add_argument("--timeout", type=float, default=3.0, help="单次 HTTP 超时秒数")
+    p.add_argument("--online-interval", type=float, default=8.0,
+                   help="在线时复查间隔秒数（默认 8）")
+    p.add_argument("--offline-interval", type=float, default=2.0,
+                   help="异常时下一轮复查间隔秒数，不含探测本身耗时（默认 2）")
+    p.add_argument("--unknown-reprobes", type=int, default=1,
+                   help="UNKNOWN 时立即清缓存并重新探测的次数（默认 1）")
+    p.add_argument("--unknown-threshold", type=int, default=1,
+                   help="连续 UNKNOWN 轮次达到该值后允许使用已有可信 Portal 重新认证（默认 1）")
+    p.add_argument("--no-unknown-reauth", action="store_true",
+                   help="关闭 UNKNOWN 状态主动重新认证，仅在确认 CAPTIVE 时登录")
+    p.add_argument("--auth-cooldown", type=float, default=20.0,
+                   help="Portal 返回认证成功后再次 POST 的最短间隔秒数（默认 20）")
+    p.add_argument("--retry-base", type=float, default=5.0,
+                   help="失败重试初始退避秒数（默认 5）")
+    p.add_argument("--retry-max", type=float, default=60.0,
+                   help="失败重试最大退避秒数（默认 60）")
     p.add_argument("--once", action="store_true", help="仅检测并尝试一次认证")
     p.add_argument("--debug", action="store_true", help="打印网络诊断详情")
     p.add_argument("--no-color", action="store_true", help="关闭终端 ANSI 颜色（默认自动检测）")
@@ -1228,6 +1309,16 @@ def main():
     args = p.parse_args()
     if args.timeout <= 0:
         p.error("--timeout 必须大于 0")
+    if args.online_interval <= 0 or args.offline_interval <= 0:
+        p.error("检测间隔必须大于 0")
+    if not 0 <= args.unknown_reprobes <= 3:
+        p.error("--unknown-reprobes 必须在 0 到 3 之间")
+    if args.unknown_threshold < 1:
+        p.error("--unknown-threshold 必须不小于 1")
+    if args.auth_cooldown < 10:
+        p.error("--auth-cooldown 必须不小于 10 秒，避免认证风暴")
+    if not 1 <= args.retry_base <= args.retry_max:
+        p.error("重试退避需满足 1 <= --retry-base <= --retry-max")
     Watchdog(args).start()
 
 
